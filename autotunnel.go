@@ -7,9 +7,11 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/user"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	autotunnelconfig "github.com/kamaln7/autotunnel/internal/config"
@@ -38,7 +40,7 @@ type connection struct {
 	wg     sync.WaitGroup
 
 	host            *host
-	proxy           *connection
+	proxy           Proxy
 	ll              *logrus.Entry
 	dialTimeout     time.Duration
 	inactiveTimeout time.Duration
@@ -53,6 +55,7 @@ type connection struct {
 	currentConnections uint32
 	inactiveTimer      *time.Timer
 	connectionsMutex   sync.RWMutex
+	isProxy            bool
 }
 
 type tunnel struct {
@@ -72,6 +75,30 @@ type tunnel struct {
 	currentConnections uint32
 }
 
+type commandProxy struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	ll              *logrus.Entry
+	command         []string
+	inactiveTimeout time.Duration
+
+	active             bool
+	process            *os.Process
+	conn               net.Conn
+	mtx                sync.RWMutex
+	inactiveTimer      *time.Timer
+	currentConnections uint32
+}
+
+type Proxy interface {
+	Dial(ctx context.Context, ll *logrus.Entry, n, addr string) (net.Conn, error)
+	Active() bool
+	TrackConnection()
+	TrackConnectionClosed()
+}
+
 func New(ctx context.Context, c *autotunnelconfig.Config, ll *logrus.Logger) (*AutoTunnel, error) {
 	at := &AutoTunnel{
 		config:      c,
@@ -81,7 +108,6 @@ func New(ctx context.Context, c *autotunnelconfig.Config, ll *logrus.Logger) (*A
 
 	at.ctx, at.cancel = context.WithCancel(ctx)
 	hosts := make(map[string]*host)
-	proxies := make(map[string]string)
 	for i, t := range at.config.Tunnels {
 		ll := ll.WithField("tunnel_index", i)
 		if t.Name == "" {
@@ -111,7 +137,6 @@ func New(ctx context.Context, c *autotunnelconfig.Config, ll *logrus.Logger) (*A
 
 		hosts[t.Host] = &host{}
 		if t.JumpHost != "" {
-			proxies[t.Host] = t.JumpHost
 			hosts[t.JumpHost] = &host{}
 		}
 	}
@@ -152,8 +177,34 @@ func New(ctx context.Context, c *autotunnelconfig.Config, ll *logrus.Logger) (*A
 		at.connections[alias] = conn
 	}
 
-	for alias, p := range proxies {
-		at.connections[alias].proxy = at.connections[p]
+	for _, t := range at.config.Tunnels {
+		if at.connections[t.Host].proxy != nil {
+			continue
+		}
+
+		var proxy Proxy
+		if t.JumpHost != "" {
+			p := at.connections[t.JumpHost]
+			if !p.isProxy {
+				p.isProxy = true
+				p.ll = p.ll.WithField("proxy_type", "jump_host")
+			}
+			proxy = p
+		} else if len(t.JumpCommand) > 0 {
+			ll.WithField("jump_command", t.JumpCommand).Trace("creating command proxy")
+			p := &commandProxy{
+				ll: at.ll.WithFields(logrus.Fields{
+					"jump_command": t.JumpCommand,
+					"proxy_type":   "jump_command",
+				}),
+				command:         t.JumpCommand,
+				inactiveTimeout: at.config.InactiveTimeout,
+				wg:              at.wg,
+			}
+			p.ctx, p.cancel = context.WithCancel(at.ctx)
+			proxy = p
+		}
+		at.connections[t.Host].proxy = proxy
 	}
 
 	for _, t := range at.config.Tunnels {
@@ -282,16 +333,15 @@ func (t *tunnel) accept() {
 
 func (t *tunnel) trackConnection() {
 	atomic.AddUint32(&t.currentConnections, 1)
+	t.connection.TrackConnection()
 }
 
 func (t *tunnel) trackConnectionClosed() {
 	defer atomic.AddUint32(&t.currentConnections, ^uint32(0))
+	defer t.connection.TrackConnectionClosed()
 }
 
 func (t *tunnel) forward(ll *logrus.Entry, conn net.Conn) {
-	go t.trackConnection()
-	go t.connection.trackConnection()
-
 	var remoteConn net.Conn
 	defer func() {
 		go conn.Close()
@@ -305,9 +355,9 @@ func (t *tunnel) forward(ll *logrus.Entry, conn net.Conn) {
 		return
 	}
 
+	go t.trackConnection()
 	defer func() {
 		go t.trackConnectionClosed()
-		go t.connection.trackConnectionClosed()
 	}()
 
 	ll.Trace("forwarding connection")
@@ -416,17 +466,7 @@ func (c *connection) start() {
 
 	ll := c.ll
 	if c.proxy != nil {
-		ll = ll.WithField("proxy", c.proxy.host.alias)
-		ll.Debug("getting proxy client")
-		proxyCl := c.proxy.client()
-		if proxyCl == nil {
-			c.lastError = "failed to get proxy ssh client"
-			ll.Error("failed to get proxy ssh client")
-			return
-		}
-
-		ll.Debug("dialing ssh remote through proxy")
-		conn, err = proxyCl.Dial("tcp", c.host.hostport)
+		conn, err = c.proxy.Dial(ctx, ll, "tcp", c.host.hostport)
 	} else {
 		ll.Debug("dialing ssh remote")
 		d := net.Dialer{Timeout: c.dialTimeout}
@@ -524,7 +564,10 @@ func (c *connection) unpause() {
 	c.paused = false
 }
 
-func (c *connection) trackConnection() {
+func (c *connection) TrackConnection() {
+	if c.proxy != nil {
+		go c.proxy.TrackConnection()
+	}
 	c.connectionsMutex.Lock()
 	defer c.connectionsMutex.Unlock()
 	c.currentConnections++
@@ -536,7 +579,10 @@ func (c *connection) trackConnection() {
 	}
 }
 
-func (c *connection) trackConnectionClosed() {
+func (c *connection) TrackConnectionClosed() {
+	if c.proxy != nil {
+		go c.proxy.TrackConnectionClosed()
+	}
 	c.connectionsMutex.Lock()
 	defer c.connectionsMutex.Unlock()
 	c.currentConnections--
@@ -548,6 +594,10 @@ func (c *connection) trackConnectionClosed() {
 			defer c.connectionsMutex.RUnlock()
 
 			if c.currentConnections == 0 {
+				if c.isProxy {
+					// give any child connections a little time to shut down cleanly on the other side
+					time.Sleep(2 * time.Second)
+				}
 				c.ll.WithField("inactive_timeout", c.inactiveTimeout).Debug("ssh connection remained inactive, closing")
 				c.close()
 			}
@@ -663,5 +713,136 @@ func (c *NetworkInterfaceMonitor) sendState(up bool) {
 		c.upChan <- struct{}{}
 	} else {
 		c.downChan <- struct{}{}
+	}
+}
+
+func (c *connection) Active() bool {
+	return c.active
+}
+
+func (c *connection) Dial(ctx context.Context, ll *logrus.Entry, n, addr string) (net.Conn, error) {
+	ll = ll.WithField("proxy", c.host.alias)
+	ll.Debug("getting proxy client")
+	cl := c.client()
+	if cl == nil {
+		c.lastError = "failed to get proxy ssh client"
+		ll.Error("failed to get proxy ssh client")
+		return nil, errors.New("failed to get proxy ssh client")
+	}
+
+	ll.Debug("dialing ssh remote through proxy")
+	return cl.Dial(n, addr)
+}
+
+func (c *commandProxy) Active() bool {
+	return c.active
+}
+
+func (c *commandProxy) Dial(ctx context.Context, ll *logrus.Entry, n, addr string) (net.Conn, error) {
+	c.mtx.RLock()
+	if c.conn != nil {
+		c.mtx.RUnlock()
+		return c.conn, nil
+	}
+	c.mtx.RUnlock()
+
+	c.start()
+	c.mtx.RLock()
+	defer c.mtx.RUnlock()
+	return c.conn, nil
+}
+
+func (c *commandProxy) TrackConnection() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.currentConnections++
+
+	if c.inactiveTimer != nil {
+		c.ll.WithField("inactive_timeout", c.inactiveTimeout).Debug("got connection, interrupting inactive timer")
+		c.inactiveTimer.Stop()
+		c.inactiveTimer = nil
+	}
+}
+
+func (c *commandProxy) TrackConnectionClosed() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.currentConnections--
+
+	if c.currentConnections == 0 && c.inactiveTimeout != 0 {
+		c.ll.WithField("inactive_timeout", c.inactiveTimeout).Debug("all active connections were closed, proxy command will be closed if it remains inactive")
+		c.inactiveTimer = time.AfterFunc(c.inactiveTimeout, func() {
+			c.mtx.RLock()
+			defer c.mtx.RUnlock()
+
+			if c.currentConnections == 0 {
+				c.ll.WithField("inactive_timeout", c.inactiveTimeout).Debug("proxy command remained inactive, closing")
+				c.close()
+			}
+		})
+	}
+}
+
+func (c *commandProxy) start() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	if c.process != nil && c.process.Pid > 0 {
+		// another goroutine has already established a client
+		return
+	}
+
+	if err := c.ctx.Err(); err != nil {
+		c.ll.WithError(err).Error("context is closed")
+		return
+	}
+
+	p1, p2 := net.Pipe()
+	var (
+		name string
+		args []string
+	)
+	if len(c.command) > 0 {
+		name = c.command[0]
+	}
+	if len(c.command) > 1 {
+		args = c.command[1:]
+	}
+	cmd := exec.CommandContext(c.ctx, name, args...)
+	cmd.Stdin = p1
+	cmd.Stdout = p1
+	cmd.Stderr = os.Stderr
+	err := cmd.Start()
+	if err != nil {
+		c.ll.WithError(err).Warn("can't start proxy command")
+	}
+	c.wg.Add(1)
+	ll := c.ll.WithField("pid", cmd.Process.Pid)
+	go func() {
+		err := cmd.Wait()
+		ll.WithError(err).Debug("proxy command exited")
+		c.close()
+		c.process = nil
+		c.conn = nil
+		c.wg.Done()
+	}()
+	c.conn = p2
+}
+
+func (c *commandProxy) close() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.process == nil {
+		c.ll.Trace("no running proxy process")
+		return
+	}
+
+	c.active = false
+	c.ll.Debug("terminating proxy process")
+	_ = c.process.Signal(syscall.SIGTERM)
+	time.Sleep(100 * time.Millisecond)
+	if c.process.Pid > 0 {
+		c.ll.Debug("proxy process took longer than 100ms to exit; killing")
+		_ = c.process.Kill()
 	}
 }

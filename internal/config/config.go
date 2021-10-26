@@ -15,11 +15,12 @@ type Config struct {
 }
 
 type Tunnel struct {
-	Name       string
-	Host       string
-	JumpHost   string `mapstructure:"jump_host"`
-	LocalPort  string `mapstructure:"local_port"`
-	RemotePort string `mapstructure:"remote_port"`
+	Name        string
+	Host        string
+	JumpHost    string   `mapstructure:"jump_host"`
+	JumpCommand []string `mapstructure:"jump_command"`
+	LocalPort   string   `mapstructure:"local_port"`
+	RemotePort  string   `mapstructure:"remote_port"`
 }
 
 func ReadConfig(path string) (*Config, error) {
