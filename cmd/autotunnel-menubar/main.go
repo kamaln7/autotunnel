@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -29,11 +28,9 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", filepath.Join(os.Getenv("HOME"), ".config", "autotunnel", "config.yaml"), "path to config file")
-	flag.Parse()
-
+	configPath := filepath.Join(os.Getenv("HOME"), ".config", "autotunnel", "config.yaml")
 	logLevel := "info"
-	c, err := autotunnelconfig.ReadConfig(*configPath)
+	c, err := autotunnelconfig.ReadConfig(configPath)
 	if err != nil {
 		notify("Error reading config", err.Error()+"; using default log level `info`")
 	} else if c.LogLevel != "" {
@@ -42,7 +39,7 @@ func main() {
 
 	ll := logrus.New()
 
-	logPath := filepath.Join(filepath.Dir(*configPath), "autotunnel.log")
+	logPath := filepath.Join(filepath.Dir(configPath), "autotunnel.log")
 	if _, err := os.Stat(logPath); err == nil {
 		_ = os.Rename(logPath, logPath+".old")
 	}
@@ -84,7 +81,7 @@ func main() {
 		logrus.TraceLevel: logger.TRACE,
 	}[lv]
 
-	app := newApp(ll, *configPath, logPath)
+	app := newApp(ll, configPath, logPath)
 
 	err = wails.Run(&options.App{
 		Title:             "autotunnel",

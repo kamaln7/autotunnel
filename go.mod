@@ -3,7 +3,7 @@ module github.com/kamaln7/autotunnel
 go 1.16
 
 require (
-	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/davecgh/go-spew v1.1.1
 	github.com/gen2brain/beeep v0.0.0-20210529141713-5586760f0cc1
 	github.com/gopherjs/gopherjs v0.0.0-20210722203344-69c5ea87048d // indirect
 	github.com/kevinburke/ssh_config v1.1.0
