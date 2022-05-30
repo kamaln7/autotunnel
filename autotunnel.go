@@ -346,7 +346,7 @@ func (t *tunnel) forward(ll *logrus.Entry, conn net.Conn) {
 	defer func() {
 		go conn.Close()
 		if remoteConn != nil {
-			remoteConn.Close()
+			go remoteConn.Close()
 		}
 	}()
 
@@ -445,18 +445,37 @@ func (c *connection) start() {
 		return
 	}
 
+	sshAgent, err := sshAgentAuthMethod()
+	if err != nil {
+		c.ll.WithError(err).Error("error getting ssh agent")
+		return
+	}
+
+	// var hostKeyCallback ssh.HostKeyCallback
+
+	// if khc, err := knownhosts.New(filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts")); err != nil {
+	// 	c.ll.WithError(err).Warn("error getting known_hosts verifier; disabling host key checks")
+	// 	hostKeyCallback = ssh.InsecureIgnoreHostKey()
+	// } else {
+	// 	// knownhosts's callback can't handle hostnames without ports, so we add it in ourselves if it's missing
+	// 	hostKeyCallback = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+	// 		if _, _, err := net.SplitHostPort(hostname); err != nil {
+	// 			hostname = c.host.hostport
+	// 		}
+	// 		c.ll.WithField("hostname", hostname).Debug("YEET")
+	// 		return khc(hostname, remote, key)
+	// 	}
+	// }
+	// I can't figure out how to fix this error & I don't have the time
+	// ssh: handshake failed: knownhosts: SplitHostPort(pipe): address pipe: missing port in address
 	sshConfig := &ssh.ClientConfig{
 		User:            c.host.username,
-		Auth:            []ssh.AuthMethod{sshAgent()},
+		Auth:            []ssh.AuthMethod{sshAgent},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         c.dialTimeout,
 	}
 
-	var (
-		conn net.Conn
-		err  error
-	)
-
+	var conn net.Conn
 	ctx := c.ctx
 	if c.dialTimeout != 0 {
 		var cancel context.CancelFunc
@@ -488,9 +507,43 @@ func (c *connection) start() {
 	c.cl = ssh.NewClient(ncc, chans, reqs)
 	c.active = true
 	go func() {
-		err := c.cl.Conn.Wait()
+		err := c.cl.Wait()
 		ll.WithError(err).Debug("ssh client closed")
+		c.wg.Done()
 		c.close()
+	}()
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for c.ctx.Err() == nil {
+			select {
+			case <-t.C:
+				c.clMutex.RLock()
+				if c.cl == nil {
+					c.ll.Debug("ssh client closed. stopping heartbeat loop")
+					c.clMutex.RUnlock()
+					return
+				}
+
+				deadline := time.Now().Add(time.Minute).Add(5 * time.Second)
+				err := conn.SetDeadline(deadline)
+				if err != nil {
+					c.ll.WithError(err).Debug("setting ssh heartbeat deadline")
+					c.clMutex.RUnlock()
+					return
+				}
+
+				_, _, err = c.cl.SendRequest("keepalive@openssh.com", true, nil)
+				if err != nil {
+					c.ll.WithError(err).Info("ssh heartbeat failed. closing connection")
+					go c.close()
+				}
+				_ = conn.SetDeadline(time.Time{})
+				c.clMutex.RUnlock()
+			case <-c.ctx.Done():
+			}
+		}
+		c.ll.WithError(c.ctx.Err()).Debug("stopping ssh heartbeat due to error")
 	}()
 }
 
@@ -517,9 +570,15 @@ func (c *connection) client() *ssh.Client {
 	c.clMutex.RLock()
 	if c.cl != nil {
 		c.clMutex.RUnlock()
-		return c.cl
+		if c.proxy != nil && !c.proxy.Active() {
+			c.ll.Debug("tried to get client from an active connection with an inactive proxy. closing connection & starting a new one")
+			c.close()
+		} else {
+			return c.cl
+		}
+	} else {
+		c.clMutex.RUnlock()
 	}
-	c.clMutex.RUnlock()
 
 	c.start()
 	c.clMutex.RLock()
@@ -539,7 +598,6 @@ func (c *connection) close() {
 		return
 	}
 
-	c.wg.Done()
 	c.active = false
 	c.ll.Debug("closing ssh client")
 	c.cl.Close()
@@ -585,7 +643,9 @@ func (c *connection) TrackConnectionClosed() {
 	}
 	c.connectionsMutex.Lock()
 	defer c.connectionsMutex.Unlock()
-	c.currentConnections--
+	if c.currentConnections > 0 {
+		c.currentConnections--
+	}
 
 	if c.currentConnections == 0 && c.inactiveTimeout != 0 {
 		c.ll.WithField("inactive_timeout", c.inactiveTimeout).Debug("all active connections were closed, ssh connection will be closed if it remains inactive")
@@ -599,8 +659,9 @@ func (c *connection) TrackConnectionClosed() {
 					time.Sleep(2 * time.Second)
 				}
 				c.ll.WithField("inactive_timeout", c.inactiveTimeout).Debug("ssh connection remained inactive, closing")
-				c.close()
+				go c.close()
 			}
+			c.inactiveTimer = nil
 		})
 	}
 }
@@ -612,11 +673,12 @@ func (c *connection) Paused() bool {
 	return c.paused
 }
 
-func sshAgent() ssh.AuthMethod {
-	if sshAgent, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK")); err == nil {
-		return ssh.PublicKeysCallback(agent.NewClient(sshAgent).Signers)
+func sshAgentAuthMethod() (ssh.AuthMethod, error) {
+	sshAgent, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	return ssh.PublicKeysCallback(agent.NewClient(sshAgent).Signers), nil
 }
 
 type TunnelStatus struct {
@@ -741,11 +803,13 @@ func (c *commandProxy) Active() bool {
 func (c *commandProxy) Dial(ctx context.Context, ll *logrus.Entry, n, addr string) (net.Conn, error) {
 	c.mtx.RLock()
 	if c.conn != nil {
+		c.ll.Trace("Dial(): not starting new proxy command; using existing conn")
 		c.mtx.RUnlock()
 		return c.conn, nil
 	}
 	c.mtx.RUnlock()
 
+	c.ll.Trace("Dial(): starting new proxy command")
 	c.start()
 	c.mtx.RLock()
 	defer c.mtx.RUnlock()
@@ -767,7 +831,9 @@ func (c *commandProxy) TrackConnection() {
 func (c *commandProxy) TrackConnectionClosed() {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
-	c.currentConnections--
+	if c.currentConnections > 0 {
+		c.currentConnections--
+	}
 
 	if c.currentConnections == 0 && c.inactiveTimeout != 0 {
 		c.ll.WithField("inactive_timeout", c.inactiveTimeout).Debug("all active connections were closed, proxy command will be closed if it remains inactive")
@@ -777,8 +843,9 @@ func (c *commandProxy) TrackConnectionClosed() {
 
 			if c.currentConnections == 0 {
 				c.ll.WithField("inactive_timeout", c.inactiveTimeout).Debug("proxy command remained inactive, closing")
-				c.close()
+				go c.close()
 			}
+			c.inactiveTimer = nil
 		})
 	}
 }
@@ -789,11 +856,12 @@ func (c *commandProxy) start() {
 
 	if c.process != nil && c.process.Pid > 0 {
 		// another goroutine has already established a client
+		c.ll.WithField("pid", c.process.Pid).Debug("not starting new command proxy process; using existing one instead")
 		return
 	}
 
 	if err := c.ctx.Err(); err != nil {
-		c.ll.WithError(err).Error("context is closed")
+		c.ll.WithError(c.ctx.Err()).Error("not starting new command proxy process; context is closed")
 		return
 	}
 
@@ -805,25 +873,26 @@ func (c *commandProxy) start() {
 	if len(c.command) > 0 {
 		name = c.command[0]
 	}
+	c.ll.WithField("command", c.command).Debug("starting new commandProxy process")
 	if len(c.command) > 1 {
 		args = c.command[1:]
 	}
 	cmd := exec.CommandContext(c.ctx, name, args...)
 	cmd.Stdin = p1
 	cmd.Stdout = p1
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = c.ll.Writer()
 	err := cmd.Start()
 	if err != nil {
-		c.ll.WithError(err).Warn("can't start proxy command")
+		c.ll.WithError(err).Error("can't start proxy command")
+		return
 	}
-	c.wg.Add(1)
 	ll := c.ll.WithField("pid", cmd.Process.Pid)
+	c.process = cmd.Process
+	c.wg.Add(1)
 	go func() {
 		err := cmd.Wait()
 		ll.WithError(err).Debug("proxy command exited")
 		c.close()
-		c.process = nil
-		c.conn = nil
 		c.wg.Done()
 	}()
 	c.conn = p2
@@ -832,17 +901,18 @@ func (c *commandProxy) start() {
 func (c *commandProxy) close() {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
+	c.active = false
+
 	if c.process == nil {
 		c.ll.Trace("no running proxy process")
+		c.conn = nil
 		return
 	}
 
-	c.active = false
 	c.ll.Debug("terminating proxy process")
-	_ = c.process.Signal(syscall.SIGTERM)
-	time.Sleep(100 * time.Millisecond)
-	if c.process.Pid > 0 {
-		c.ll.Debug("proxy process took longer than 100ms to exit; killing")
-		_ = c.process.Kill()
-	}
+	_ = c.process.Signal(syscall.SIGINT)
+	time.Sleep(250 * time.Millisecond)
+	_ = c.process.Kill()
+	c.conn = nil
+	c.process = nil
 }
