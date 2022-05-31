@@ -886,6 +886,7 @@ func (c *commandProxy) start() {
 		c.ll.WithError(err).Error("can't start proxy command")
 		return
 	}
+	c.active = true
 	ll := c.ll.WithField("pid", cmd.Process.Pid)
 	c.process = cmd.Process
 	c.wg.Add(1)
