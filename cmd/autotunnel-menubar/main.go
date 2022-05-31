@@ -214,7 +214,7 @@ func (a *app) onMenuDidClose() {
 }
 
 func (a *app) refreshTray() {
-	a.ll.Debug("refresh tray")
+	a.ll.Trace("refresh tray")
 
 	a.ll.Trace("grabbing read mutex")
 	a.lock.RLock()
@@ -232,7 +232,7 @@ func (a *app) refreshTray() {
 	a.tray.Label = boolText(a.at == nil, "!at", "at")
 	if a.at != nil {
 		status := a.at.Status()
-		a.ll.WithField("status", status).Debug("got status")
+		a.ll.WithField("status", status).Trace("got status")
 		for _, s := range status {
 			var label string
 			if s.Paused {
